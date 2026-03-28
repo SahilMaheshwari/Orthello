@@ -43,6 +43,8 @@ import time
 from pathlib import Path
 from typing import List, Tuple
 
+from tqdm import tqdm
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -329,12 +331,12 @@ def run_ga(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Evaluation / benchmark mode
+# Evaluation 1 model vs random and greedy baselines
 # ──────────────────────────────────────────────────────────────────────
 
 def benchmark_model(model_path: str, n_games: int = 200):
     """Load a saved model and benchmark it against random and greedy agents."""
-    ckpt = torch.load(model_path, map_location=DEVICE)
+    ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
     net = OthelloNet().to(DEVICE)
     net.load_state_dict(ckpt["state_dict"])
     agent = net_agent(net)
@@ -362,6 +364,98 @@ def benchmark_model(model_path: str, n_games: int = 200):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Evaluation 2 models
+# ──────────────────────────────────────────────────────────────────────
+
+def load_model_agent(model_path: str):
+    """Load a saved .pt model and return (net, agent, metadata)."""
+    ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
+    net = OthelloNet().to(DEVICE)
+    net.load_state_dict(ckpt["state_dict"])
+    agent = net_agent(net)
+
+    meta = {
+        "generation": ckpt.get("generation", "?"),
+        "fitness": ckpt.get("fitness", "?"),
+        "path": model_path,
+    }
+    return net, agent, meta
+
+
+def evaluate_models(model_a_path: str, model_b_path: str, n_games: int = EVAL_GAMES):
+    """
+    Evaluate two saved models against each other.
+    Plays n_games with A as Black, then n_games with B as Black.
+    Total games = 2 * n_games.
+    """
+    _, agent_a, meta_a = load_model_agent(model_a_path)
+    _, agent_b, meta_b = load_model_agent(model_b_path)
+
+    print(f"\nLoaded Model A: {meta_a['path']} (gen={meta_a['generation']}, fitness={meta_a['fitness']})")
+    print(f"Loaded Model B: {meta_b['path']} (gen={meta_b['generation']}, fitness={meta_b['fitness']})")
+
+    results = {
+        "A_wins": 0,
+        "B_wins": 0,
+        "draws": 0,
+    }
+
+    total_margin_a = 0
+    total_margin_b = 0
+    total_games = 2 * n_games
+
+    with tqdm(total=total_games, desc="Model vs Model", unit="game") as pbar:
+        # A plays Black
+        for _ in range(n_games):
+            w, s = play_game(agent_a, agent_b)
+            total_margin_a += (s[1] - s[-1])
+            total_margin_b += (s[-1] - s[1])
+
+            if w == 1:
+                results["A_wins"] += 1
+            elif w == -1:
+                results["B_wins"] += 1
+            else:
+                results["draws"] += 1
+
+            pbar.update(1)
+
+        # B plays Black
+        for _ in range(n_games):
+            w, s = play_game(agent_b, agent_a)
+            total_margin_b += (s[1] - s[-1])
+            total_margin_a += (s[-1] - s[1])
+
+            if w == 1:
+                results["B_wins"] += 1
+            elif w == -1:
+                results["A_wins"] += 1
+            else:
+                results["draws"] += 1
+
+            pbar.update(1)
+
+    a_score = results["A_wins"] + 0.5 * results["draws"]
+    b_score = results["B_wins"] + 0.5 * results["draws"]
+
+    print(f"\nModel A vs Model B ({total_games} total games):")
+    print(f"  Model A wins : {results['A_wins']}")
+    print(f"  Draws        : {results['draws']}")
+    print(f"  Model B wins : {results['B_wins']}")
+    print(f"  Model A score: {a_score:.1f}/{total_games} ({100 * a_score / total_games:.1f}%)")
+    print(f"  Model B score: {b_score:.1f}/{total_games} ({100 * b_score / total_games:.1f}%)")
+    print(f"  Avg margin A : {total_margin_a / total_games:.2f}")
+    print(f"  Avg margin B : {total_margin_b / total_games:.2f}")
+
+    if a_score > b_score:
+        print("\n🏆 Winner: Model A")
+    elif b_score > a_score:
+        print("\n🏆 Winner: Model B")
+    else:
+        print("\n🤝 Result: Tie")
+
+
+# ──────────────────────────────────────────────────────────────────────
 # CLI
 # ──────────────────────────────────────────────────────────────────────
 
@@ -373,14 +467,19 @@ def parse_args():
     p.add_argument("--pop",         type=int, default=POPULATION_SIZE,
                    help="Population size")
     p.add_argument("--eval-games",  type=int, default=EVAL_GAMES,
-                   help="Games vs champion per fitness evaluation (per side)")
+                   help="Games per side for fitness evaluation / model-vs-model eval")
     p.add_argument("--save-dir",    type=str, default=SAVE_DIR)
+
     p.add_argument("--eval",        action="store_true",
                    help="Benchmark a saved model instead of training")
     p.add_argument("--model",       type=str, default=None,
                    help="Path to .pt model file (used with --eval)")
     p.add_argument("--bench-games", type=int, default=200,
                    help="Number of benchmark games (used with --eval)")
+
+    p.add_argument("--eval-models", nargs=2, metavar=("MODEL_A", "MODEL_B"),
+                   help="Evaluate two saved models against each other")
+
     p.add_argument("--seed",        type=int, default=42)
     return p.parse_args()
 
@@ -393,7 +492,11 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    if args.eval:
+    if args.eval_models:
+        model_a, model_b = args.eval_models
+        evaluate_models(model_a, model_b, n_games=args.eval_games)
+
+    elif args.eval:
         model_path = args.model
         if model_path is None:
             # Try to find best_ever.pt automatically
@@ -404,6 +507,7 @@ if __name__ == "__main__":
                 print("No model specified. Use --model <path.pt>")
                 exit(1)
         benchmark_model(model_path, n_games=args.bench_games)
+
     else:
         best_net = run_ga(
             generations=args.generations,
