@@ -1,2 +1,3 @@
 ga_models/
-ga_models_newweightsmargins/
+ga_models_winmargin/
+pycache/

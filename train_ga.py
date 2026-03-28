@@ -48,7 +48,7 @@ import torch
 import torch.nn as nn
 
 # Import our Othello engine
-from othello import OthelloGame, play_game, random_agent, greedy_agent
+from orthello import OthelloGame, play_game, random_agent, greedy_agent
 
 # ──────────────────────────────────────────────────────────────────────
 # Hyper-parameters (all overridable via CLI)
@@ -61,7 +61,7 @@ MUTATION_STD    = 0.08        # std of Gaussian noise added on mutation
 CROSSOVER_RATE  = 0.70        # probability child inherits from parent A vs B per weight
 EVAL_GAMES      = 6           # games played (as Black) vs champion to score fitness
 GENERATIONS     = 30          # total generations to run
-SAVE_DIR        = "ga_models" # directory for checkpoints
+SAVE_DIR        = "ga_models_winmargin_betterscoring" # directory for checkpoints
 DEVICE          = torch.device("cpu")   # switch to "cuda" if available
 
 
@@ -191,20 +191,22 @@ def evaluate_individual(net: OthelloNet, opponent_agent, n_games: int = EVAL_GAM
     agent = net_agent(net)
     score = 0.0
     for _ in range(n_games):
-        w = play_game(agent, opponent_agent)
+        w, s = play_game(agent, opponent_agent)
         if w == 1:
             score += 1.0
         elif w == 0:
             score += 0.5
+        score += (s[1] - 32)/64  # margin bonus (normalized score difference)
 
     for _ in range(n_games):
-        w = play_game(opponent_agent, agent)
+        w, s = play_game(opponent_agent, agent)
         if w == -1:
             score += 1.0
         elif w == 0:
             score += 0.5
+        score += (s[-1] - 32)/64  # margin bonus (normalized score difference)
 
-    return score
+    return max(0, score)
 
 
 def evaluate_population(
@@ -344,10 +346,10 @@ def benchmark_model(model_path: str, n_games: int = 200):
     for opp_name, opp_agent in [("random", random_agent), ("greedy", greedy_agent)]:
         results = {1: 0, -1: 0, 0: 0}
         for _ in range(n_games // 2):
-            w = play_game(agent, opp_agent)       # our model plays Black
+            w, s = play_game(agent, opp_agent)       # our model plays Black
             results[w] += 1
         for _ in range(n_games // 2):
-            w = play_game(opp_agent, agent)       # our model plays White
+            w, s = play_game(opp_agent, agent)       # our model plays White
             # flip perspective
             results[-w] += 1
 
