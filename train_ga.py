@@ -51,20 +51,24 @@ import torch.nn as nn
 
 # Import our Othello engine
 from orthello import OthelloGame, play_game, random_agent, greedy_agent, search_agent
+from cli_utils import get_formatter
 # ──────────────────────────────────────────────────────────────────────
 # Hyper-parameters (all overridable via CLI)
 # ──────────────────────────────────────────────────────────────────────
 
-POPULATION_SIZE = 60          # individuals per generation
-ELITE_FRAC      = 0.15        # fraction kept unchanged each generation
-MUTATION_RATE   = 0.12        # probability of perturbing each weight
-MUTATION_STD    = 0.08        # std of Gaussian noise added on mutation
-CROSSOVER_RATE  = 0.70        # probability child inherits from parent A vs B per weight
-EVAL_GAMES      = 6           # games played (as Black) vs champion to score fitness
-GENERATIONS     = 30          # total generations to run
+POPULATION_SIZE = 60                                  # individuals per generation
+ELITE_FRAC      = 0.15                                # fraction kept unchanged each generation
+MUTATION_RATE   = 0.12                                # probability of perturbing each weight
+MUTATION_STD    = 0.08                                # std of Gaussian noise added on mutation
+CROSSOVER_RATE  = 0.70                                # probability child inherits from parent A vs B per weight
+EVAL_GAMES      = 6                                   # games played (as Black) vs champion to score fitness
+GENERATIONS     = 30                                  # total generations to run
 SAVE_DIR        = "ga_models_winmargin_betterscoring" # directory for checkpoints
-DEVICE          = torch.device("cpu")   # switch to "cuda" if available
-
+DEVICE          = torch.device("cpu")                 # switch to "cuda" if available
+ARCHIVE_MAX       = 12                                # max number of old champions kept
+POOL_ARCHIVE_SAMP = 3                                 # how many archive champs to sample per generation
+POOL_PEER_SAMP    = 3                                 # how many random peers each individual faces
+MARGIN_WEIGHT     = 0.15                              # how much score margin matters vs win/loss
 
 # ──────────────────────────────────────────────────────────────────────
 # Neural network
@@ -184,41 +188,90 @@ def make_child(parents_flat: List[np.ndarray], fitnesses: np.ndarray) -> np.ndar
 # Fitness evaluation
 # ──────────────────────────────────────────────────────────────────────
 
-def evaluate_individual(net: OthelloNet, opponent_agent, n_games: int = EVAL_GAMES) -> float:
+
+def clone_net(net: OthelloNet) -> OthelloNet:
+    """Deep-copy a model safely onto DEVICE."""
+    return copy.deepcopy(net).to(DEVICE)
+
+
+def evaluate_individual(
+    net: OthelloNet,
+    opponent_agents: List,
+    games_per_opponent: int = 2,
+) -> float:
     """
-    Score one network against `opponent_agent`.
-    Plays n_games as Black and n_games as White → 2*n_games total.
-    Returns wins + 0.5*draws (max = 2*n_games).
+    Evaluate one network against a pool of opponents.
+
+    For each opponent:
+      - plays games_per_opponent as Black
+      - plays games_per_opponent as White
+
+    Returns average fitness across all games:
+      result_score + small margin bonus
     """
     agent = net_agent(net)
-    score = 0.0
-    for _ in range(n_games):
-        w, s = play_game(agent, opponent_agent)
-        if w == 1:
-            score += 1.0
-        elif w == 0:
-            score += 0.5
-        score += (s[1] - 32)/64  # margin bonus (normalized score difference)
 
-    for _ in range(n_games):
-        w, s = play_game(opponent_agent, agent)
-        if w == -1:
-            score += 1.0
-        elif w == 0:
-            score += 0.5
-        score += (s[-1] - 32)/64  # margin bonus (normalized score difference)
+    total_score = 0.0
+    total_games = 0
 
-    return max(0, score)
+    for opponent_agent in opponent_agents:
+        # Play as Black
+        for _ in range(games_per_opponent):
+            w, s = play_game(agent, opponent_agent)
+
+            result_score = 1.0 if w == 1 else 0.5 if w == 0 else 0.0
+            margin_score = (s[1] - s[-1]) / 64.0   # our score - opp score
+            total_score += result_score + MARGIN_WEIGHT * margin_score
+            total_games += 1
+
+        # Play as White
+        for _ in range(games_per_opponent):
+            w, s = play_game(opponent_agent, agent)
+
+            result_score = 1.0 if w == -1 else 0.5 if w == 0 else 0.0
+            margin_score = (s[-1] - s[1]) / 64.0   # our score - opp score
+            total_score += result_score + MARGIN_WEIGHT * margin_score
+            total_games += 1
+
+    return max(0.0, total_score / max(1, total_games))
 
 
 def evaluate_population(
     population: List[OthelloNet],
-    champion_agent,
-    n_games: int = EVAL_GAMES,
+    fixed_opponents: List,
+    peer_sample_size: int = POOL_PEER_SAMP,
+    games_per_opponent: int = 2,
 ) -> np.ndarray:
+    """
+    Evaluate each individual against:
+      - fixed opponents (champions / baselines / archive)
+      - a few random peers from the same generation
+
+    This makes fitness much more robust than single-champion evaluation.
+    """
     fitnesses = np.zeros(len(population))
-    for i, net in enumerate(population):
-        fitnesses[i] = evaluate_individual(net, champion_agent, n_games)
+
+    with tqdm(total=len(population), desc="Evaluating population", unit="individual",
+              bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+              colour='cyan') as pbar:
+        for i, net in enumerate(population):
+            opponents = list(fixed_opponents)
+
+            # Sample a few peers from the same generation (excluding self)
+            peer_indices = [j for j in range(len(population)) if j != i]
+            if peer_indices:
+                sampled = random.sample(peer_indices, min(peer_sample_size, len(peer_indices)))
+                for j in sampled:
+                    opponents.append(net_agent(population[j]))
+
+            fitnesses[i] = evaluate_individual(
+                net,
+                opponents,
+                games_per_opponent=games_per_opponent,
+            )
+            pbar.set_postfix({"fitness": f"{fitnesses[i]:.3f}"})
+            pbar.update(1)
+
     return fitnesses
 
 
@@ -234,24 +287,32 @@ def run_ga(
 ):
     os.makedirs(save_dir, exist_ok=True)
     log_lines = []
+    fmt = get_formatter()
 
     def log(msg: str):
         print(msg)
         log_lines.append(msg)
 
     # ── Initialise population ──────────────────────────────────────────
-    log(f"\n{'═'*60}")
-    log(f"  Othello Genetic Algorithm Training")
-    log(f"  Population : {population_size}")
-    log(f"  Generations: {generations}")
-    log(f"  Eval games : {eval_games}  (× 2 sides  = {eval_games*2} per individual)")
-    log(f"  Elite frac : {ELITE_FRAC}")
-    log(f"  Mutation   : rate={MUTATION_RATE}  std={MUTATION_STD}")
-    log(f"{'═'*60}\n")
+    fmt.header("🧬 Othello Genetic Algorithm Training", width=65)
+    
+    config_lines = [
+        f"Population  : {population_size}",
+        f"Generations : {generations}",
+        f"Eval games  : {eval_games} per opponent (× 2 sides = {eval_games*2} per individual)",
+        f"Elite frac  : {ELITE_FRAC} ({max(1, int(population_size * ELITE_FRAC))} individuals)",
+        f"Mutation    : rate={MUTATION_RATE}  std={MUTATION_STD}",
+    ]
+    
+    for line in config_lines:
+        log(f"  {line}")
+    log("")
 
     population: List[OthelloNet] = [OthelloNet().to(DEVICE) for _ in range(population_size)]
+    champion_archive: List[OthelloNet] = []
+    best_ever_agent = random_agent
 
-    champion_net = None      # best individual from previous generation
+    champion_net = None     
     #TODO CHECK
     #champion_agent = lambda g: search_agent(g, depth=3)   # gen 0 opponent is the search agent (depth=3) baseline
     champion_agent = random_agent  # gen 0 opponent is the random agent baseline (easier)
@@ -262,21 +323,39 @@ def run_ga(
 
     for gen in range(1, generations + 1):
         t_start = time.time()
-        log(f"── Generation {gen:03d} ──────────────────────────────────────")
+        fmt.subheader(f"Generation {gen:03d}/{generations:03d}")
+
+        # ── Build opponent pool ────────────────────────────────────────
+        fixed_opponents = [champion_agent, best_ever_agent, greedy_agent]
+
+        if champion_archive:
+            sampled_archive = random.sample(
+                champion_archive,
+                min(POOL_ARCHIVE_SAMP, len(champion_archive))
+            )
+            fixed_opponents.extend([net_agent(n) for n in sampled_archive])
 
         # ── Evaluate ───────────────────────────────────────────────────
-        fitnesses = evaluate_population(population, champion_agent, eval_games)
+        fitnesses = evaluate_population(
+            population,
+            fixed_opponents=fixed_opponents,
+            peer_sample_size=POOL_PEER_SAMP,
+            games_per_opponent=eval_games,
+        )
 
         ranked_idx = np.argsort(fitnesses)[::-1]    # descending
         best_fitness = fitnesses[ranked_idx[0]]
         mean_fitness = fitnesses.mean()
         worst_fitness = fitnesses[ranked_idx[-1]]
 
-        log(f"  Fitness  best={best_fitness:.2f}  mean={mean_fitness:.2f}  worst={worst_fitness:.2f}")
+        fmt.stats_line(best=f"{best_fitness:.3f}", mean=f"{mean_fitness:.3f}", worst=f"{worst_fitness:.3f}")
 
         # ── Save champion ──────────────────────────────────────────────
         champion_net = copy.deepcopy(population[ranked_idx[0]])
         champion_agent = net_agent(champion_net)
+        champion_archive.append(clone_net(champion_net))
+        if len(champion_archive) > ARCHIVE_MAX:
+            champion_archive.pop(0)
 
         ckpt_path = os.path.join(save_dir, f"best_gen_{gen:03d}.pt")
         torch.save({
@@ -287,13 +366,18 @@ def run_ga(
 
         if best_fitness > best_ever_fitness:
             best_ever_fitness = best_fitness
-            best_ever_net = copy.deepcopy(champion_net)
+            best_ever_net = clone_net(champion_net)
+            best_ever_agent = net_agent(best_ever_net)
+
             torch.save({
                 "generation": gen,
                 "fitness":    best_ever_fitness,
                 "state_dict": best_ever_net.state_dict(),
             }, os.path.join(save_dir, "best_ever.pt"))
-            log(f"  ★ New best-ever: {best_ever_fitness:.2f}  (saved best_ever.pt)")
+
+            fmt.success(f"New best-ever: {best_ever_fitness:.3f}  (saved best_ever.pt)")
+        
+        fmt.info(f"Time: {time.time() - t_start:.1f}s")
 
         # ── Build next generation ──────────────────────────────────────
         flat_weights = [get_flat_weights(population[i]) for i in ranked_idx]
@@ -313,21 +397,18 @@ def run_ga(
             new_population.append(child_net)
 
         population = new_population
-        elapsed = time.time() - t_start
-        log(f"  Time: {elapsed:.1f}s\n")
 
     # ── Final report ───────────────────────────────────────────────────
-    log(f"\n{'═'*60}")
-    log(f"  Training complete!")
-    log(f"  Best-ever fitness: {best_ever_fitness:.2f}")
-    log(f"  Model saved to: {os.path.join(save_dir, 'best_ever.pt')}")
-    log(f"{'═'*60}")
+    fmt.section("🎯 Training Complete")
+    fmt.highlight("Best-ever fitness:", f"{best_ever_fitness:.2f}", color="green")
+    fmt.highlight("Model saved to:", os.path.join(save_dir, 'best_ever.pt'), color="yellow")
 
     # Save log
     log_path = os.path.join(save_dir, "training_log.txt")
     with open(log_path, "w") as f:
         f.write("\n".join(log_lines))
-    print(f"\nLog written to {log_path}")
+    fmt.success(f"Log written to {log_path}")
+    print()
 
     return best_ever_net
 
@@ -338,6 +419,8 @@ def run_ga(
 
 def benchmark_model(model_path: str, n_games: int = 200):
     """Load a saved model and benchmark it against random and greedy agents."""
+    fmt = get_formatter()
+    
     ckpt = torch.load(model_path, map_location=DEVICE, weights_only=False)
     net = OthelloNet().to(DEVICE)
     net.load_state_dict(ckpt["state_dict"])
@@ -345,9 +428,15 @@ def benchmark_model(model_path: str, n_games: int = 200):
 
     gen = ckpt.get("generation", "?")
     fitness = ckpt.get("fitness", "?")
-    print(f"\nLoaded model from {model_path}  (gen={gen}, fitness={fitness})")
+    fmt.header(f"📊 Model Benchmark", width=60)
+    fmt.highlight("Loaded model:", model_path, color="cyan")
+    fmt.highlight("Generation:", f"{gen}", color="yellow")
+    fmt.highlight("Fitness:", f"{fitness}", color="green")
+    print()
 
-    with tqdm(total=n_games * 3, desc="Benchmarking", unit="game") as pbar:
+    with tqdm(total=n_games * 3, desc="Playing games", unit="game",
+              bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+              colour='green') as pbar:
         for opp_name, opp_agent in [
             ("random", random_agent),
             ("greedy", greedy_agent),
@@ -366,11 +455,10 @@ def benchmark_model(model_path: str, n_games: int = 200):
                 pbar.update(1)
 
             win_rate = (results[1] + 0.5 * results[0]) / n_games * 100
-            print(f"\n  vs {opp_name} ({n_games} games):")
-            print(f"    Wins  : {results[1]}")
-            print(f"    Draws : {results[0]}")
-            print(f"    Losses: {results[-1]}")
-            print(f"    Win%  : {win_rate:.1f}%")
+            fmt.subheader(f"vs {opp_name} ({n_games} games)")
+            fmt.stats_line(Wins=results[1], Draws=results[0], Losses=results[-1], Win_pct=f"{win_rate:.1f}%")
+    
+    print()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -398,11 +486,17 @@ def evaluate_models(model_a_path: str, model_b_path: str, n_games: int = EVAL_GA
     Plays n_games with A as Black, then n_games with B as Black.
     Total games = 2 * n_games.
     """
+    fmt = get_formatter()
+    
     _, agent_a, meta_a = load_model_agent(model_a_path)
     _, agent_b, meta_b = load_model_agent(model_b_path)
 
-    print(f"\nLoaded Model A: {meta_a['path']} (gen={meta_a['generation']}, fitness={meta_a['fitness']})")
-    print(f"Loaded Model B: {meta_b['path']} (gen={meta_b['generation']}, fitness={meta_b['fitness']})")
+    fmt.header("⚔️  Model vs Model", width=60)
+    fmt.highlight("Model A:", meta_a['path'], color="cyan")
+    fmt.highlight("  Gen / Fitness:", f"{meta_a['generation']} / {meta_a['fitness']}", color="yellow")
+    fmt.highlight("Model B:", meta_b['path'], color="magenta")
+    fmt.highlight("  Gen / Fitness:", f"{meta_b['generation']} / {meta_b['fitness']}", color="yellow")
+    print()
 
     # A as Black
     a_black = {
@@ -426,7 +520,9 @@ def evaluate_models(model_a_path: str, model_b_path: str, n_games: int = EVAL_GA
 
     total_games = 2 * n_games
 
-    with tqdm(total=total_games, desc="Model vs Model", unit="game") as pbar:
+    with tqdm(total=total_games, desc="Playing games", unit="game",
+              bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+              colour='blue') as pbar:
         # ── A plays Black ─────────────────────────────────────────────
         for _ in range(n_games):
             w, s = play_game(agent_a, agent_b)
@@ -480,52 +576,47 @@ def evaluate_models(model_a_path: str, model_b_path: str, n_games: int = EVAL_GA
     b_score_total = total_b_wins + 0.5 * total_draws
 
     # ── Print breakdown ───────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("MODEL VS MODEL RESULTS")
-    print("=" * 60)
+    fmt = get_formatter()
+    fmt.header("🏆 Model vs Model Results", width=62)
 
-    print(f"\nModel A: {meta_a['path']}")
-    print(f"Model B: {meta_b['path']}")
+    fmt.subheader(f"Model A: {meta_a['path']}")
+    fmt.subheader(f"Model B: {meta_b['path']}")
+    print()
 
-    print("\n--- When A plays BLACK ---")
-    print(f"A wins        : {a_black['A_wins']}")
-    print(f"Draws         : {a_black['draws']}")
-    print(f"B wins        : {a_black['B_wins']}")
-    print(f"A avg points  : {a_black['A_points'] / n_games:.2f}")
-    print(f"B avg points  : {a_black['B_points'] / n_games:.2f}")
-    print(f"Avg margin(A) : {a_black['margin_sum'] / n_games:+.2f}")
+    fmt.section("When A plays BLACK")
+    fmt.stats_line(A_wins=a_black['A_wins'], Draws=a_black['draws'], B_wins=a_black['B_wins'])
+    fmt.stats_line(A_avg_points=f"{a_black['A_points'] / n_games:.2f}", 
+                   B_avg_points=f"{a_black['B_points'] / n_games:.2f}",
+                   A_margin=f"{a_black['margin_sum'] / n_games:+.2f}")
 
-    print("\n--- When B plays BLACK ---")
-    print(f"B wins        : {b_black['B_wins']}")
-    print(f"Draws         : {b_black['draws']}")
-    print(f"A wins        : {b_black['A_wins']}")
-    print(f"B avg points  : {b_black['B_points'] / n_games:.2f}")
-    print(f"A avg points  : {b_black['A_points'] / n_games:.2f}")
-    print(f"Avg margin(A) : {b_black['margin_sum'] / n_games:+.2f}")
+    fmt.section("When B plays BLACK")
+    fmt.stats_line(B_wins=b_black['B_wins'], Draws=b_black['draws'], A_wins=b_black['A_wins'])
+    fmt.stats_line(B_avg_points=f"{b_black['B_points'] / n_games:.2f}",
+                   A_avg_points=f"{b_black['A_points'] / n_games:.2f}",
+                   A_margin=f"{b_black['margin_sum'] / n_games:+.2f}")
 
-    print("\n--- By Model Color ---")
-    print(f"A as Black    : {a_black['A_wins']}W / {a_black['draws']}D / {a_black['B_wins']}L")
-    print(f"A as White    : {b_black['A_wins']}W / {b_black['draws']}D / {b_black['B_wins']}L")
-    print(f"B as Black    : {b_black['B_wins']}W / {b_black['draws']}D / {b_black['A_wins']}L")
-    print(f"B as White    : {a_black['B_wins']}W / {a_black['draws']}D / {a_black['A_wins']}L")
+    fmt.section("By Model Color")
+    print(f"  A as Black (W/D/L): {a_black['A_wins']}/{a_black['draws']}/{a_black['B_wins']}")
+    print(f"  A as White (W/D/L): {b_black['A_wins']}/{b_black['draws']}/{b_black['B_wins']}")
+    print(f"  B as Black (W/D/L): {b_black['B_wins']}/{b_black['draws']}/{b_black['A_wins']}")
+    print(f"  B as White (W/D/L): {a_black['B_wins']}/{a_black['draws']}/{a_black['A_wins']}")
 
-    print("\n--- Overall ---")
-    print(f"Total games   : {total_games}")
-    print(f"A wins        : {total_a_wins}")
-    print(f"Draws         : {total_draws}")
-    print(f"B wins        : {total_b_wins}")
-    print(f"A score       : {a_score_total:.1f}/{total_games} ({100 * a_score_total / total_games:.1f}%)")
-    print(f"B score       : {b_score_total:.1f}/{total_games} ({100 * b_score_total / total_games:.1f}%)")
-    print(f"A avg points  : {total_a_points / total_games:.2f}")
-    print(f"B avg points  : {total_b_points / total_games:.2f}")
-    print(f"Avg margin(A) : {total_margin / total_games:+.2f}")
+    fmt.section("Overall Results")
+    fmt.stats_line(Total_games=total_games, A_wins=total_a_wins, Draws=total_draws, B_wins=total_b_wins)
+    fmt.stats_line(A_score=f"{a_score_total:.1f}/{total_games} ({100 * a_score_total / total_games:.1f}%)",
+                   B_score=f"{b_score_total:.1f}/{total_games} ({100 * b_score_total / total_games:.1f}%)")
+    fmt.stats_line(A_avg_points=f"{total_a_points / total_games:.2f}",
+                   B_avg_points=f"{total_b_points / total_games:.2f}",
+                   A_margin=f"{total_margin / total_games:+.2f}")
 
     if a_score_total > b_score_total:
-        print("\n🏆 Winner: Model A")
+        fmt.success("Winner: Model A 🏆")
     elif b_score_total > a_score_total:
-        print("\n🏆 Winner: Model B")
+        fmt.success("Winner: Model B 🏆")
     else:
-        print("\n🤝 Result: Tie")
+        fmt.info("Result: Tie 🤝")
+    
+    print()
 
 # ──────────────────────────────────────────────────────────────────────
 # CLI

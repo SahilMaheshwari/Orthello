@@ -1,3 +1,7 @@
 ga_models/
 ga_models_winmargin/
 pycache/
+CLI_IMPROVEMENTS.md
+clu_utils.py
+install_cli_deps.sh
+ga_models_winmargin_betterscoring/

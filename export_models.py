@@ -42,6 +42,7 @@ from pathlib import Path
 
 import torch
 
+from cli_utils import get_formatter
 
 # ── Import OthelloNet from train_ga ───────────────────────────────────
 try:
@@ -130,17 +131,19 @@ def main():
                     help="Output directory for JSON files (default: same as --dir)")
     args = ap.parse_args()
 
+    fmt = get_formatter()
+
     # Collect input files
     if args.model:
         if not os.path.isfile(args.model):
-            print(f"ERROR: file not found: {args.model}", file=sys.stderr)
+            fmt.error(f"File not found: {args.model}")
             sys.exit(1)
         pt_files = [args.model]
         out_dir = args.out_dir or os.path.dirname(args.model) or "."
     else:
         if not os.path.isdir(args.dir):
-            print(f"ERROR: directory not found: {args.dir}", file=sys.stderr)
-            print("       Train a model first with:  python train_ga.py")
+            fmt.error(f"Directory not found: {args.dir}")
+            fmt.info("Train a model first with:  python train_ga.py")
             sys.exit(1)
         # Sorted generation checkpoints
         pt_files = sorted(glob.glob(os.path.join(args.dir, "best_gen_*.pt")))
@@ -153,13 +156,13 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     if not pt_files:
-        print("No .pt files found.  Train a model first:  python train_ga.py")
+        fmt.warning("No .pt files found. Train a model first:  python train_ga.py")
         sys.exit(0)
 
-    print(f"\n{'═'*56}")
-    print(f"  Othello GA Model Exporter")
-    print(f"  Exporting {len(pt_files)} checkpoint(s) → {out_dir}/")
-    print(f"{'═'*56}\n")
+    fmt.header("💾 Othello GA Model Exporter", width=58)
+    fmt.highlight(f"Exporting", f"{len(pt_files)} checkpoint(s)", color="cyan")
+    fmt.highlight(f"Output directory", out_dir, color="yellow")
+    print()
 
     manifest = []
     t0 = time.time()
@@ -170,13 +173,10 @@ def main():
         try:
             info = export_one(pt_path, json_path)
             manifest.append(info)
-            tag = "★ best-ever" if info["best_ever"] else ""
-            print(f"  ✓  Gen {info['generation']:03d}"
-                  f"  fitness={info['fitness']:.1f}"
-                  f"  {info['size_kb']:.0f} KB"
-                  f"  {tag}")
+            tag = "⭐ best-ever" if info["best_ever"] else ""
+            fmt.success(f"Gen {info['generation']:03d}  |  fitness={info['fitness']:.1f}  |  {info['size_kb']:.0f} KB {tag}")
         except Exception as exc:
-            print(f"  ✗  {pt_path}: {exc}")
+            fmt.error(f"{pt_path}: {exc}")
 
     # Write manifest (sorted by generation, best_ever last)
     manifest.sort(key=lambda x: (x["best_ever"], x["generation"]))
@@ -185,10 +185,13 @@ def main():
         json.dump(manifest, f, indent=2)
 
     elapsed = time.time() - t0
-    print(f"\n  Manifest written → {manifest_path}")
-    print(f"  Done in {elapsed:.1f}s\n")
-    print("  Next step: open othello_frontend.html and use")
-    print("  'Load Generations' to import these JSON files.\n")
+    print()
+    fmt.info(f"Manifest written → {manifest_path}")
+    fmt.highlight("Done in", f"{elapsed:.1f}s", color="green")
+    print()
+    fmt.subheader("Next step")
+    print("  Open othello_frontend.html and use 'Load Generations'")
+    print("  to import these JSON files.\n")
 
 
 if __name__ == "__main__":
