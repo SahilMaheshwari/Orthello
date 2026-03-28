@@ -56,19 +56,32 @@ from cli_utils import get_formatter
 # Hyper-parameters (all overridable via CLI)
 # ──────────────────────────────────────────────────────────────────────
 
-POPULATION_SIZE = 60                                  # individuals per generation
-ELITE_FRAC      = 0.15                                # fraction kept unchanged each generation
-MUTATION_RATE   = 0.12                                # probability of perturbing each weight
-MUTATION_STD    = 0.08                                # std of Gaussian noise added on mutation
-CROSSOVER_RATE  = 0.70                                # probability child inherits from parent A vs B per weight
-EVAL_GAMES      = 6                                   # games played (as Black) vs champion to score fitness
-GENERATIONS     = 30                                  # total generations to run
-SAVE_DIR        = "ga_models_winmargin_betterscoring" # directory for checkpoints
-DEVICE          = torch.device("cpu")                 # switch to "cuda" if available
-ARCHIVE_MAX       = 12                                # max number of old champions kept
-POOL_ARCHIVE_SAMP = 3                                 # how many archive champs to sample per generation
-POOL_PEER_SAMP    = 3                                 # how many random peers each individual faces
-MARGIN_WEIGHT     = 0.15                              # how much score margin matters vs win/loss
+POPULATION_SIZE   = 60                                  # individuals per generation
+ELITE_FRAC        = 0.15                                # fraction kept unchanged each generation
+MUTATION_RATE     = 0.12                                # probability of perturbing each weight
+MUTATION_STD      = 0.08                                # std of Gaussian noise added on mutation
+CROSSOVER_RATE    = 0.70                                # probability child inherits from parent A vs B per weight
+EVAL_GAMES        = 3                                   # games played (as Black) vs champion to score fitness
+GENERATIONS       = 30                                  # total generations to run
+SAVE_DIR          = "ga_models_winmargin_betterscoring" # directory for checkpoints
+DEVICE            = torch.device("cpu")                 # switch to "cuda" if available
+ARCHIVE_MAX       = 12                                  # max number of old champions kept
+POOL_ARCHIVE_SAMP = 3                                   # how many archive champs to sample per generation
+POOL_PEER_SAMP    = 3                                   # how many random peers each individual faces
+MARGIN_WEIGHT     = 0.15                                # how much score margin matters vs win/loss
+POSITION_WEIGHT   = 0.12                                # how much board positional strength matters
+
+STABILITY_MATRIX = np.array([
+    [20, -10,  4,  3,  3,  4, -10, 20],
+    [-10, -20, -2, -2, -2, -2, -20, -10],
+    [4,   -2,  0,  0,  0,  0,  -2,  4],
+    [3,   -2,  0,  1,  1,  0,  -2,  3],
+    [3,   -2,  0,  1,  1,  0,  -2,  3],
+    [4,   -2,  0,  0,  0,  0,  -2,  4],
+    [-10, -20, -2, -2, -2, -2, -20, -10],
+    [20, -10,  4,  3,  3,  4, -10, 20],
+], dtype=np.float32)
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Neural network
@@ -193,6 +206,22 @@ def clone_net(net: OthelloNet) -> OthelloNet:
     """Deep-copy a model safely onto DEVICE."""
     return copy.deepcopy(net).to(DEVICE)
 
+def positional_score_from_board(board: np.ndarray, player: int) -> float:
+    """
+    Positional board score from `player`'s perspective using STABILITY_MATRIX.
+
+    board values:
+      +1 = black
+      -1 = white
+       0 = empty
+    """
+    own_mask = (board == player).astype(np.float32)
+    opp_mask = (board == -player).astype(np.float32)
+
+    own_score = np.sum(STABILITY_MATRIX * own_mask)
+    opp_score = np.sum(STABILITY_MATRIX * opp_mask)
+
+    return float(own_score - opp_score)
 
 def evaluate_individual(
     net: OthelloNet,
@@ -217,20 +246,32 @@ def evaluate_individual(
     for opponent_agent in opponent_agents:
         # Play as Black
         for _ in range(games_per_opponent):
-            w, s = play_game(agent, opponent_agent)
+            w, s, final_board = play_game(agent, opponent_agent)
 
             result_score = 1.0 if w == 1 else 0.5 if w == 0 else 0.0
             margin_score = (s[1] - s[-1]) / 64.0   # our score - opp score
-            total_score += result_score + MARGIN_WEIGHT * margin_score
+            pos_score = positional_score_from_board(final_board, player=1) / 100.0
+
+            total_score += (
+                result_score
+                + MARGIN_WEIGHT * margin_score
+                + POSITION_WEIGHT * pos_score
+)
             total_games += 1
 
         # Play as White
         for _ in range(games_per_opponent):
-            w, s = play_game(opponent_agent, agent)
+            w, s, final_board = play_game(opponent_agent, agent)
 
             result_score = 1.0 if w == -1 else 0.5 if w == 0 else 0.0
             margin_score = (s[-1] - s[1]) / 64.0   # our score - opp score
-            total_score += result_score + MARGIN_WEIGHT * margin_score
+            pos_score = positional_score_from_board(final_board, player=-1) / 100.0
+
+            total_score += (
+                result_score
+                + MARGIN_WEIGHT * margin_score
+                + POSITION_WEIGHT * pos_score
+            )
             total_games += 1
 
     return max(0.0, total_score / max(1, total_games))
@@ -326,7 +367,7 @@ def run_ga(
         fmt.subheader(f"Generation {gen:03d}/{generations:03d}")
 
         # ── Build opponent pool ────────────────────────────────────────
-        fixed_opponents = [champion_agent, best_ever_agent, greedy_agent]
+        fixed_opponents = [champion_agent, best_ever_agent, greedy_agent, search_agent(depth=2)]
 
         if champion_archive:
             sampled_archive = random.sample(
@@ -440,7 +481,7 @@ def benchmark_model(model_path: str, n_games: int = 200):
         for opp_name, opp_agent in [
             ("random", random_agent),
             ("greedy", greedy_agent),
-            ("search_depth3", lambda g: search_agent(g, depth=2)),
+            ("search_depth2", lambda g: search_agent(g, depth=2)),
         ]:  
             results = {1: 0, -1: 0, 0: 0}
             for _ in range(n_games // 2):

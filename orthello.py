@@ -227,7 +227,7 @@ def play_game(black_fn, white_fn, verbose=False):
         w = game.get_winner()
         print("\nGame over!", {1: "Black wins!", -1: "White wins!", 0: "Draw!"}[w])
 
-    return game.get_winner(), game.get_score()
+    return game.get_winner(), game.get_score(), game.board.copy()
 
 
 # ------------------------------------------------------------------
