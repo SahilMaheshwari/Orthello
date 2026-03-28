@@ -50,8 +50,7 @@ import torch
 import torch.nn as nn
 
 # Import our Othello engine
-from orthello import OthelloGame, play_game, random_agent, greedy_agent
-
+from orthello import OthelloGame, play_game, random_agent, greedy_agent, search_agent
 # ──────────────────────────────────────────────────────────────────────
 # Hyper-parameters (all overridable via CLI)
 # ──────────────────────────────────────────────────────────────────────
@@ -132,6 +131,7 @@ def net_agent(net: OthelloNet):
         return (best_idx // 8, best_idx % 8)
 
     return agent
+    
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -252,7 +252,9 @@ def run_ga(
     population: List[OthelloNet] = [OthelloNet().to(DEVICE) for _ in range(population_size)]
 
     champion_net = None      # best individual from previous generation
-    champion_agent = random_agent   # gen 0 opponent is the random baseline
+    #TODO CHECK
+    #champion_agent = lambda g: search_agent(g, depth=3)   # gen 0 opponent is the search agent (depth=3) baseline
+    champion_agent = random_agent  # gen 0 opponent is the random agent baseline (easier)
 
     n_elite = max(1, int(population_size * ELITE_FRAC))
     best_ever_fitness = -1.0
@@ -345,22 +347,30 @@ def benchmark_model(model_path: str, n_games: int = 200):
     fitness = ckpt.get("fitness", "?")
     print(f"\nLoaded model from {model_path}  (gen={gen}, fitness={fitness})")
 
-    for opp_name, opp_agent in [("random", random_agent), ("greedy", greedy_agent)]:
-        results = {1: 0, -1: 0, 0: 0}
-        for _ in range(n_games // 2):
-            w, s = play_game(agent, opp_agent)       # our model plays Black
-            results[w] += 1
-        for _ in range(n_games // 2):
-            w, s = play_game(opp_agent, agent)       # our model plays White
-            # flip perspective
-            results[-w] += 1
+    with tqdm(total=n_games * 3, desc="Benchmarking", unit="game") as pbar:
+        for opp_name, opp_agent in [
+            ("random", random_agent),
+            ("greedy", greedy_agent),
+            ("search_depth3", lambda g: search_agent(g, depth=2)),
+        ]:  
+            results = {1: 0, -1: 0, 0: 0}
+            for _ in range(n_games // 2):
+                w, s = play_game(agent, opp_agent)       # our model plays Black
+                results[w] += 1
+                pbar.update(1)
+    
+            for _ in range(n_games // 2):
+                w, s = play_game(opp_agent, agent)       # our model plays White
+                # flip perspective
+                results[-w] += 1
+                pbar.update(1)
 
-        win_rate = (results[1] + 0.5 * results[0]) / n_games * 100
-        print(f"\n  vs {opp_name} ({n_games} games):")
-        print(f"    Wins  : {results[1]}")
-        print(f"    Draws : {results[0]}")
-        print(f"    Losses: {results[-1]}")
-        print(f"    Win%  : {win_rate:.1f}%")
+            win_rate = (results[1] + 0.5 * results[0]) / n_games * 100
+            print(f"\n  vs {opp_name} ({n_games} games):")
+            print(f"    Wins  : {results[1]}")
+            print(f"    Draws : {results[0]}")
+            print(f"    Losses: {results[-1]}")
+            print(f"    Win%  : {win_rate:.1f}%")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -394,66 +404,128 @@ def evaluate_models(model_a_path: str, model_b_path: str, n_games: int = EVAL_GA
     print(f"\nLoaded Model A: {meta_a['path']} (gen={meta_a['generation']}, fitness={meta_a['fitness']})")
     print(f"Loaded Model B: {meta_b['path']} (gen={meta_b['generation']}, fitness={meta_b['fitness']})")
 
-    results = {
+    # A as Black
+    a_black = {
         "A_wins": 0,
         "B_wins": 0,
         "draws": 0,
+        "A_points": 0,
+        "B_points": 0,
+        "margin_sum": 0,   # A score - B score
     }
 
-    total_margin_a = 0
-    total_margin_b = 0
+    # B as Black
+    b_black = {
+        "A_wins": 0,
+        "B_wins": 0,
+        "draws": 0,
+        "A_points": 0,
+        "B_points": 0,
+        "margin_sum": 0,   # A score - B score
+    }
+
     total_games = 2 * n_games
 
     with tqdm(total=total_games, desc="Model vs Model", unit="game") as pbar:
-        # A plays Black
+        # ── A plays Black ─────────────────────────────────────────────
         for _ in range(n_games):
             w, s = play_game(agent_a, agent_b)
-            total_margin_a += (s[1] - s[-1])
-            total_margin_b += (s[-1] - s[1])
+
+            a_score = s[1]     # Black = A
+            b_score = s[-1]    # White = B
+
+            a_black["A_points"] += a_score
+            a_black["B_points"] += b_score
+            a_black["margin_sum"] += (a_score - b_score)
 
             if w == 1:
-                results["A_wins"] += 1
+                a_black["A_wins"] += 1
             elif w == -1:
-                results["B_wins"] += 1
+                a_black["B_wins"] += 1
             else:
-                results["draws"] += 1
+                a_black["draws"] += 1
 
             pbar.update(1)
 
-        # B plays Black
+        # ── B plays Black ─────────────────────────────────────────────
         for _ in range(n_games):
             w, s = play_game(agent_b, agent_a)
-            total_margin_b += (s[1] - s[-1])
-            total_margin_a += (s[-1] - s[1])
+
+            b_score = s[1]     # Black = B
+            a_score = s[-1]    # White = A
+
+            b_black["A_points"] += a_score
+            b_black["B_points"] += b_score
+            b_black["margin_sum"] += (a_score - b_score)
 
             if w == 1:
-                results["B_wins"] += 1
+                b_black["B_wins"] += 1
             elif w == -1:
-                results["A_wins"] += 1
+                b_black["A_wins"] += 1
             else:
-                results["draws"] += 1
+                b_black["draws"] += 1
 
             pbar.update(1)
 
-    a_score = results["A_wins"] + 0.5 * results["draws"]
-    b_score = results["B_wins"] + 0.5 * results["draws"]
+    # ── Totals ────────────────────────────────────────────────────────
+    total_a_wins = a_black["A_wins"] + b_black["A_wins"]
+    total_b_wins = a_black["B_wins"] + b_black["B_wins"]
+    total_draws  = a_black["draws"]  + b_black["draws"]
 
-    print(f"\nModel A vs Model B ({total_games} total games):")
-    print(f"  Model A wins : {results['A_wins']}")
-    print(f"  Draws        : {results['draws']}")
-    print(f"  Model B wins : {results['B_wins']}")
-    print(f"  Model A score: {a_score:.1f}/{total_games} ({100 * a_score / total_games:.1f}%)")
-    print(f"  Model B score: {b_score:.1f}/{total_games} ({100 * b_score / total_games:.1f}%)")
-    print(f"  Avg margin A : {total_margin_a / total_games:.2f}")
-    print(f"  Avg margin B : {total_margin_b / total_games:.2f}")
+    total_a_points = a_black["A_points"] + b_black["A_points"]
+    total_b_points = a_black["B_points"] + b_black["B_points"]
+    total_margin = a_black["margin_sum"] + b_black["margin_sum"]
 
-    if a_score > b_score:
+    a_score_total = total_a_wins + 0.5 * total_draws
+    b_score_total = total_b_wins + 0.5 * total_draws
+
+    # ── Print breakdown ───────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("MODEL VS MODEL RESULTS")
+    print("=" * 60)
+
+    print(f"\nModel A: {meta_a['path']}")
+    print(f"Model B: {meta_b['path']}")
+
+    print("\n--- When A plays BLACK ---")
+    print(f"A wins        : {a_black['A_wins']}")
+    print(f"Draws         : {a_black['draws']}")
+    print(f"B wins        : {a_black['B_wins']}")
+    print(f"A avg points  : {a_black['A_points'] / n_games:.2f}")
+    print(f"B avg points  : {a_black['B_points'] / n_games:.2f}")
+    print(f"Avg margin(A) : {a_black['margin_sum'] / n_games:+.2f}")
+
+    print("\n--- When B plays BLACK ---")
+    print(f"B wins        : {b_black['B_wins']}")
+    print(f"Draws         : {b_black['draws']}")
+    print(f"A wins        : {b_black['A_wins']}")
+    print(f"B avg points  : {b_black['B_points'] / n_games:.2f}")
+    print(f"A avg points  : {b_black['A_points'] / n_games:.2f}")
+    print(f"Avg margin(A) : {b_black['margin_sum'] / n_games:+.2f}")
+
+    print("\n--- By Model Color ---")
+    print(f"A as Black    : {a_black['A_wins']}W / {a_black['draws']}D / {a_black['B_wins']}L")
+    print(f"A as White    : {b_black['A_wins']}W / {b_black['draws']}D / {b_black['B_wins']}L")
+    print(f"B as Black    : {b_black['B_wins']}W / {b_black['draws']}D / {b_black['A_wins']}L")
+    print(f"B as White    : {a_black['B_wins']}W / {a_black['draws']}D / {a_black['A_wins']}L")
+
+    print("\n--- Overall ---")
+    print(f"Total games   : {total_games}")
+    print(f"A wins        : {total_a_wins}")
+    print(f"Draws         : {total_draws}")
+    print(f"B wins        : {total_b_wins}")
+    print(f"A score       : {a_score_total:.1f}/{total_games} ({100 * a_score_total / total_games:.1f}%)")
+    print(f"B score       : {b_score_total:.1f}/{total_games} ({100 * b_score_total / total_games:.1f}%)")
+    print(f"A avg points  : {total_a_points / total_games:.2f}")
+    print(f"B avg points  : {total_b_points / total_games:.2f}")
+    print(f"Avg margin(A) : {total_margin / total_games:+.2f}")
+
+    if a_score_total > b_score_total:
         print("\n🏆 Winner: Model A")
-    elif b_score > a_score:
+    elif b_score_total > a_score_total:
         print("\n🏆 Winner: Model B")
     else:
         print("\n🤝 Result: Tie")
-
 
 # ──────────────────────────────────────────────────────────────────────
 # CLI

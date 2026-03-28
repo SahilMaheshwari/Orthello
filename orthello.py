@@ -251,6 +251,52 @@ def greedy_agent(game: OthelloGame):
             best, best_move = n, (r, c)
     return best_move
 
+def evaluate_board(game: OthelloGame, player: int) -> float:
+    """Simple evaluation: piece difference from player's perspective."""
+    score = game.get_score()
+    return score[player] - score[-player]
+
+
+def negamax(game: OthelloGame, depth: int, player: int) -> float:
+    if depth == 0 or game.is_game_over():
+        return evaluate_board(game, player)
+
+    moves = game.get_valid_moves()
+    if not moves:
+        # pass move
+        g2 = game.copy()
+        g2.make_move(-1, -1)
+        return -negamax(g2, depth - 1, -player)
+
+    best = -float("inf")
+
+    for r, c in moves:
+        g2 = game.copy()
+        g2.make_move(r, c)
+        val = -negamax(g2, depth - 1, -player)
+        best = max(best, val)
+
+    return best
+
+
+def search_agent(game: OthelloGame, depth: int = 3):
+    moves = game.get_valid_moves()
+    if not moves:
+        return (-1, -1)
+
+    best_move = moves[0]
+    best_score = -float("inf")
+
+    for r, c in moves:
+        g2 = game.copy()
+        g2.make_move(r, c)
+        score = -negamax(g2, depth - 1, -game.current_player)
+
+        if score > best_score:
+            best_score = score
+            best_move = (r, c)
+
+    return best_move
 
 def human_agent(game: OthelloGame):
     valid = game.get_valid_moves()
